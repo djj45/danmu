@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>弹幕播放器 · Danmaku Player</title>
+<style>
+  :root {
+    --pink: #fb7299;
+    --blue: #23ade5;
+    --bar: rgba(21, 21, 21, 0.9);
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d0d10;
+    color: #e7e7e8;
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    min-height: 100vh;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 28px 16px 60px; }
+
+  header { margin-bottom: 18px; }
+  header h1 { font-size: 22px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  header h1 .tag {
+    font-size: 12px; font-weight: 500; color: var(--pink);
+    border: 1px solid rgba(251, 114, 153, 0.5); border-radius: 999px; padding: 2px 10px;
+  }
+  header p { color: #9a9aa3; font-size: 13px; margin-top: 8px; line-height: 1.7; }
+
+  /* ---------- 播放器 ---------- */
+  .player-wrap { position: relative; }
+  .player {
+    position: relative; width: 100%; aspect-ratio: 16 / 9;
+    background: #000; border-radius: var(--radius); overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.55);
+  }
+  .player video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; }
+  .player .danmaku-canvas { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+
+  .live-badge {
+    position: absolute; top: 12px; left: 12px; z-index: 4;
+    background: #ff4d5e; color: #fff; font-size: 12px; font-weight: 700;
+    padding: 2px 8px; border-radius: 4px; letter-spacing: 1px;
+  }
+  .stats {
+    position: absolute; top: 12px; right: 12px; z-index: 4;
+    font-size: 12px; color: #fff; background: rgba(0, 0, 0, 0.45);
+    padding: 4px 10px; border-radius: 6px; font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, Menlo, monospace; pointer-events: none;
+  }
+  .center-tip {
+    position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 14px; text-shadow: 0 1px 4px rgba(0,0,0,.8);
+    background: rgba(0,0,0,.35); backdrop-filter: blur(2px); cursor: pointer; user-select: none;
+  }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.25); border-top-color: #fff;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hidden { display: none !important; }
+
+  /* ---------- 控制栏 ---------- */
+  .controls {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 6;
+    padding: 6px 10px 8px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.35) 30%, rgba(0, 0, 0, 0.78));
+    transition: opacity 0.25s, transform 0.25s;
+  }
+  .player.ctrl-hidden .controls { opacity: 0; transform: translateY(8px); pointer-events: none; }
+  .progress {
+    position: relative; height: 14px; display: flex; align-items: center; cursor: pointer;
+    touch-action: none;
+  }
+  .progress .rail { position: absolute; left: 0; right: 0; height: 3px; background: rgba(255,255,255,.22); border-radius: 2px; transition: height .12s; }
+  .progress:hover .rail { height: 5px; }
+  .progress .buffered { position: absolute; left: 0; height: inherit; width: 0; background: rgba(255,255,255,.35); border-radius: 2px; }
+  .progress .played { position: absolute; left: 0; height: inherit; width: 0; background: var(--pink); border-radius: 2px; }
+  .progress .knob {
+    position: absolute; width: 11px; height: 11px; border-radius: 50%;
+    background: #fff; transform: translateX(-50%) scale(0); transition: transform .12s;
+    box-shadow: 0 0 4px rgba(0,0,0,.5);
+  }
+  .progress:hover .knob { transform: translateX(-50%) scale(1); }
+
+  .btn-row { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
+  .ctl {
+    appearance: none; border: 0; background: transparent; color: #fff; cursor: pointer;
+    width: 34px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 6px; opacity: .92;
+  }
+  .ctl:hover { background: rgba(255,255,255,.14); }
+  .ctl svg { width: 19px; height: 19px; fill: currentColor; }
+  .time { font-size: 12px; color: #ddd; font-variant-numeric: tabular-nums; padding: 0 6px; white-space: nowrap; }
+  .spacer { flex: 1; }
+
+  .dm-input-group {
+    display: flex; align-items: center; gap: 6px; margin: 0 8px;
+    background: rgba(255,255,255,.14); border-radius: 8px; padding: 2px;
+  }
+  .dm-input-group input[type="text"] {
+    width: 170px; background: transparent; border: 0; outline: 0; color: #fff;
+    font-size: 13px; padding: 5px 8px;
+  }
+  .dm-input-group input[type="text"]::placeholder { color: rgba(255,255,255,.5); }
+  .dm-input-group input[type="color"] {
+    width: 22px; height: 22px; border: 0; padding: 0; background: transparent; cursor: pointer; border-radius: 4px;
+  }
+  .send-btn {
+    border: 0; background: var(--pink); color: #fff; font-size: 12px; font-weight: 600;
+    padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .send-btn:hover { filter: brightness(1.1); }
+  .stress-btn {
+    border: 1px solid rgba(255,255,255,.35); background: transparent; color: #fff;
+    font-size: 12px; padding: 5px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  .stress-btn:hover { background: rgba(255,255,255,.12); }
+
+  .vol-wrap { display: flex; align-items: center; }
+  .vol-wrap input[type="range"] { width: 0; opacity: 0; transition: width .2s, opacity .2s; }
+  .vol-wrap:hover input[type="range"], .vol-wrap input[type="range"]:focus { width: 64px; opacity: 1; }
+  input[type="range"].vol {
+    accent-color: var(--pink); height: 3px; cursor: pointer;
+  }
+
+  /* ---------- 设置面板 ---------- */
+  .settings-pop {
+    position: absolute; right: 12px; bottom: 58px; z-index: 8;
+    width: 250px; background: var(--bar); border-radius: 10px; padding: 14px;
+    box-shadow: 0 6px 30px rgba(0,0,0,.5); font-size: 12px; color: #ddd;
+  }
+  .settings-pop .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 10px; }
+  .settings-pop .row:last-child { margin-bottom: 0; }
+  .settings-pop label { white-space: nowrap; }
+  .settings-pop .row .val { color: #fff; font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
+  .settings-pop input[type="range"] { flex: 1; accent-color: var(--pink); }
+  .seg { display: flex; gap: 4px; }
+  .seg button {
+    border: 0; background: rgba(255,255,255,.12); color: #ddd; font-size: 12px;
+    padding: 3px 8px; border-radius: 5px; cursor: pointer;
+  }
+  .seg button.on { background: var(--pink); color: #fff; }
+  .switch { position: relative; width: 34px; height: 18px; border-radius: 999px; background: rgba(255,255,255,.2); cursor: pointer; transition: background .2s; border: 0; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .2s; }
+  .switch.on { background: var(--pink); }
+  .switch.on::after { left: 18px; }
+
+  /* ---------- 源 & 说明 ---------- */
+  .src-card {
+    margin-top: 16px; background: #17171c; border: 1px solid #26262e;
+    border-radius: var(--radius); padding: 16px;
+  }
+  .src-card h2 { font-size: 14px; margin-bottom: 10px; color: #fff; }
+  .src-row { display: flex; gap: 8px; }
+  .src-row input {
+    flex: 1; background: #0f0f13; border: 1px solid #2c2c36; color: #e7e7e8;
+    border-radius: 8px; padding: 9px 12px; font-size: 13px; outline: none;
+  }
+  .src-row input:focus { border-color: var(--pink); }
+  .src-row button {
+    border: 0; background: var(--pink); color: #fff; font-size: 13px; font-weight: 600;
+    padding: 0 18px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  }
+  .src-row button:hover { filter: brightness(1.1); }
+  .src-card .hint { margin-top: 10px; font-size: 12px; color: #8b8b95; line-height: 1.8; }
+  .src-card .hint code { background: #0f0f13; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: #9fc3ff; }
+
+  .toggle-row { display: flex; gap: 22px; margin-top: 12px; font-size: 13px; color: #c9c9d1; flex-wrap: wrap; }
+  .toggle-row label { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .toggle-row input[type="checkbox"] { accent-color: var(--pink); width: 15px; height: 15px; }
+
+  /* ---------- 论坛弹幕源 ---------- */
+  .forum-select { background: #0f0f13; border: 1px solid #2c2c36; color: #e7e7e8; border-radius: 8px; padding: 9px 10px; font-size: 13px; outline: none; }
+  .interval-wrap { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .interval-label { font-size: 12px; color: #9a9aa3; }
+  .forum-interval { max-width: 60px; }
+  .cred-row { margin-top: 8px; display: none; }
+  .cred-row.show { display: flex; }
+  .forum-list { list-style: none; margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .forum-list li {
+    display: flex; align-items: center; gap: 10px; font-size: 12.5px;
+    background: #0f0f13; border: 1px solid #26262e; border-radius: 8px; padding: 8px 12px;
+  }
+  .forum-list .f-type { color: var(--blue); font-weight: 600; white-space: nowrap; }
+  .forum-list .f-url { flex: 1; color: #9a9aa3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .forum-list .f-state { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .forum-list .f-state.ok { color: #01cd5e; }
+  .forum-list .f-state.err { color: #fe0302; }
+  .forum-list .f-del {
+    border: 0; background: transparent; color: #8b8b95; cursor: pointer; font-size: 15px; padding: 0 4px;
+  }
+  .forum-list .f-del:hover { color: #fe0302; }
+  .sse-dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: #666; margin-left: 6px; vertical-align: middle; transition: background .3s;
+  }
+  .sse-dot.on { background: #01cd5e; box-shadow: 0 0 6px #01cd5e; }
+  .dm-on-air { color: var(--pink); font-weight: 600; }
+
+  .qr-btn {
+    border: 0; background: var(--blue); color: #fff; font-size: 13px; font-weight: 600;
+    padding: 0 14px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  }
+  .qr-btn:hover { filter: brightness(1.1); }
+  .qr-modal {
+    position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(3px);
+  }
+  .qr-box {
+    position: relative; background: #fff; color: #333; border-radius: 14px;
+    padding: 26px 34px; text-align: center; box-shadow: 0 12px 50px rgba(0,0,0,.5);
+    max-width: 320px;
+  }
+  .qr-box h3 { font-size: 16px; margin-bottom: 14px; }
+  .qr-code { width: 220px; height: 220px; margin: 0 auto; background: #fff; display: flex; align-items: center; justify-content: center; font-size: 60px; color: #01cd5e; }
+  .qr-code svg { width: 210px; height: 210px; }
+  .qr-code img { width: 210px; height: 210px; }
+  .cred-note { font-size: 12px; color: #9a9aa3; flex: 1; }
+  .qr-status { font-size: 14px; margin: 12px 0 6px; min-height: 20px; color: #222; }
+  .qr-tip { font-size: 12px; color: #888; line-height: 1.7; }
+  .qr-retry {
+    margin-top: 10px; border: 0; background: var(--pink); color: #fff; font-size: 13px;
+    padding: 8px 18px; border-radius: 8px; cursor: pointer;
+  }
+  .qr-close {
+    position: absolute; top: 10px; right: 12px; border: 0; background: transparent;
+    color: #999; font-size: 16px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>弹幕播放器 <span class="tag">Canvas 引擎 · 丝滑同款</span></h1>
+    <p>用 Canvas + requestAnimationFrame + 轨道碰撞判定实现的弹幕引擎，弹幕数据来自 B 站真实视频。
+       支持点播（弹幕跟随进度）与直播（外部实时推送）两种模式，可粘贴 m3u8 直播源（比如春晚）。</p>
+  </header>
+
+  <div class="player-wrap">
+    <div id="player" class="player">
+      <video id="video" playsinline></video>
+      <div id="liveBadge" class="live-badge hidden">直播 LIVE</div>
+      <div id="stats" class="stats hidden"></div>
+      <div id="centerTip" class="center-tip">
+        <div class="spinner"></div>
+      </div>
+
+      <div class="controls">
+        <div id="progress" class="progress">
+          <div class="rail"><div id="buffered" class="buffered"></div><div id="played" class="played"></div></div>
+          <div id="knob" class="knob"></div>
+        </div>
+        <div class="btn-row">
+          <button id="playBtn" class="ctl" title="播放/暂停">
+            <svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5.5v13l11-6.5z"/></svg>
+          </button>
+          <div class="vol-wrap">
+            <button id="muteBtn" class="ctl" title="静音">
+              <svg viewBox="0 0 24 24" id="volIcon"><path d="M4 9v6h4l5 5V4L8 9H4zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+            </button>
+            <input id="volume" class="vol" type="range" min="0" max="1" step="0.05" value="0.6" />
+          </div>
+          <span id="timeLabel" class="time">00:00 / 00:00</span>
+          <div class="spacer"></div>
+          <div class="dm-input-group">
+            <input id="dmColor" type="color" value="#ffffff" title="弹幕颜色" />
+            <input id="dmInput" type="text" maxlength="60" placeholder="发个弹幕见证当下" />
+            <button id="sendBtn" class="send-btn">发送</button>
+          </div>
+          <button id="stressBtn" class="stress-btn" title="瞬时压入 800 条弹幕验证流畅度">压力测试</button>
+          <button id="settingsBtn" class="ctl" title="弹幕设置">
+            <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9 4c0-.6-.05-1.17-.15-1.73l2.05-1.6-2-3.46-2.4.96a8.9 8.9 0 0 0-3-1.73L15 2.5H9l-.5 2.94a8.9 8.9 0 0 0-3 1.73l-2.4-.96-2 3.46 2.05 1.6c-.1.56-.15 1.13-.15 1.73s.05 1.17.15 1.73l-2.05 1.6 2 3.46 2.4-.96a8.9 8.9 0 0 0 3 1.73L9 21.5h6l.5-2.94a8.9 8.9 0 0 0 3-1.73l2.4.96 2-3.46-2.05-1.6c.1-.56.15-1.13.15-1.73z" transform="scale(0.9) translate(1.3 1.3)"/></svg>
+          </button>
+          <button id="fullBtn" class="ctl" title="全屏">
+            <svg viewBox="0 0 24 24"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm14 0h2v5h-5v-2h3v-3z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div id="settingsPop" class="settings-pop hidden">
+        <div class="row">
+          <label>弹幕开关</label>
+          <button id="dmSwitch" class="switch on"></button>
+        </div>
+        <div class="row">
+          <label>透明度</label>
+          <input id="opacityRange" type="range" min="10" max="100" value="100" />
+          <span id="opacityVal" class="val">100%</span>
+        </div>
+        <div class="row">
+          <label>速度</label>
+          <div class="seg" id="speedSeg">
+            <button data-v="0.5">0.5x</button><button data-v="0.75">0.75x</button><button data-v="1" class="on">1x</button><button data-v="1.5">1.5x</button><button data-v="2">2x</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>字号</label>
+          <input id="fontRange" type="range" min="14" max="32" value="25" />
+          <span id="fontVal" class="val">25px</span>
+        </div>
+        <div class="row">
+          <label>显示区域</label>
+          <div class="seg" id="areaSeg">
+            <button data-v="0.25">1/4</button><button data-v="0.5">半屏</button><button data-v="0.75">3/4</button><button data-v="1" class="on">全屏</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="src-card">
+    <h2>视频源</h2>
+    <div class="src-row">
+      <input id="srcInput" type="text" spellcheck="false"
+             value="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+             placeholder="粘贴视频地址（mp4 / m3u8 直播源，例如春晚直播流）" />
+      <button id="loadSrcBtn">加载</button>
+    </div>
+    <p class="hint">
+      支持 <code>.mp4</code> 直链和 <code>.m3u8</code>（HLS 直播/点播）。Safari 原生播放 HLS；
+      Chrome/Edge 会自动加载 hls.js。接入春晚直播源后，把「模拟直播弹幕」勾上，
+      或调用 <code>engine.push({ text, color })</code> 把论坛最新回复变成弹幕。
+    </p>
+    <div class="toggle-row">
+      <label><input type="checkbox" id="sampleDmChk" checked /> 测试弹幕（B站样本）</label>
+      <label><input type="checkbox" id="simLiveChk" /> 模拟直播弹幕流（随机持续推送）</label>
+      <label><input type="checkbox" id="showStatsChk" checked /> 显示性能面板（FPS / 屏上数量）</label>
+    </div>
+  <div class="src-card">
+    <h2>论坛弹幕源 <span id="sseState" class="sse-dot" title="SSE 连接状态"></span></h2>
+    <div class="src-row">
+      <select id="forumType" class="forum-select">
+        <option value="tieba">百度贴吧</option>
+        <option value="s1">Stage1st</option>
+        <option value="nga">NGA</option>
+      </select>
+      <input id="forumUrl" type="text" spellcheck="false"
+             placeholder="帖子链接，如 https://tieba.baidu.com/p/1234567890" />
+      <div class="interval-wrap" title="每隔几秒抓一次该帖子的最新回复（最小 2 秒，太快容易被论坛风控）">
+        <span class="interval-label">轮询间隔</span>
+        <input id="forumInterval" type="number" min="2" max="120" value="6" class="forum-interval" />
+        <span class="interval-label">秒</span>
+      </div>
+      <button id="addForumBtn">添加</button>
+    </div>
+    <div class="src-row cred-row" id="tiebaCredRow">
+      <span class="cred-note">默认游客抓取；扫码登录百度账号可防游客风控（BDUSS 约十年有效）</span>
+      <button id="tiebaQrBtn" class="qr-btn">百度账号扫码登录</button>
+    </div>
+    <div class="src-row cred-row" id="s1CredRow">
+      <input id="s1User" type="text" placeholder="S1 用户名（留空则用 config.toml）" autocomplete="off" />
+      <input id="s1Pass" type="password" placeholder="S1 密码" autocomplete="off" />
+    </div>
+    <div class="src-row cred-row" id="ngaCredRow">
+      <input id="ngaCookie" type="text" spellcheck="false" placeholder="NGA Cookie（可留空，点右侧按钮扫码自动获取）" />
+      <button id="ngaQrBtn" class="qr-btn">扫码登录</button>
+    </div>
+    <ul id="forumList" class="forum-list"></ul>
+    <p class="hint">
+      <b>可以同时添加任意多个帖子</b>：同一论坛的多个帖子、不同论坛混合都没问题，每个源独立轮询互不影响，回复会汇入同一条弹幕流。
+      贴吧游客即可；S1 按项目约定走账号密码登录（config.toml 或上方输入框）；
+      NGA 必须提供 Cookie（点「扫码登录」自动获取）。
+      <span class="dm-on-air" id="dmOnAir"></span>
+    </p>
+  </div>
+</main>
+
+<div id="qrModal" class="qr-modal hidden">
+  <div class="qr-box">
+    <button id="qrCloseBtn" class="qr-close" title="关闭">✕</button>
+    <h3 id="qrTitle">扫码登录</h3>
+    <div id="qrCode" class="qr-code"></div>
+    <p id="qrStatus" class="qr-status">正在生成二维码…</p>
+    <p class="qr-tip" id="qrTip">打开对应 App 扫一扫，授权后凭据自动保存</p>
+    <button id="qrRetryBtn" class="qr-retry hidden">重新生成二维码</button>
+  </div>
+</div>
+
+<script type="module" src="src/player.js"></script>
+</body>
+</html>

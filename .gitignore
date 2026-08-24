@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 凭据与登录态（绝不能进仓库！）
+config.toml
+data/nga-cookie.json
+data/tieba-bduss.json
+
+# 运行时状态（可能含按源填入的 Cookie）
+data/sources.json
+
+# 抓包原始数据（本地保留，不入库）
+data/capture/
+
+# 系统
+.DS_Store
