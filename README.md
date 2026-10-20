@@ -80,12 +80,12 @@ B 站网页播放器的弹幕层是一个铺在视频上的 `<canvas>`（打开�
 |---|---------|-----------|---------|
 | 1 | **Canvas 而非 DOM** | DOM 弹幕每帧触发 style/layout/paint，几百条就掉帧；Canvas 只是把文字按新坐标重画一遍 | `src/danmaku.js` 整个引擎 |
 | 2 | **位置由时钟推导** `x(t) = W − v·(t−t₀)` | 不做逐帧增量累加 → 暂停、seek、切后台再回来，弹幕位置永远和时间轴精确一致，零漂移、零跳变 | `_draw()` / `clock()` |
-| 3 | **单一 rAF 循环** | 一个 `requestAnimationFrame` 驱动所有弹幕；速度用时间表示而非像素/帧，任何刷新率下手感一致 | `_frame()` |
+| 3 | **单一 rAF 循环** | 一个 `requestAnimationFrame` 驱动所有弹幕；速度用时间表示而非像素/帧，任何刷新率下手感一致。暂停且没东西要重画时循环停掉，play/seek 等事件再唤醒 | `_frame()` / `_wake()` |
 | 4 | **devicePixelRatio 缩放** | 画布物理尺寸 × dpr 再 `setTransform(dpr,…)`，Retina 屏文字锐利不发虚 | `resize()` |
 | 5 | **轨道分配 + 追尾判定** | 画面按行高切成轨道；新弹幕入轨前判断"会不会在途中追上前车"（匀速运动可精确算出追上时刻）。文字越小速度越慢，越长越快 | `_pickScrollLane()` |
-| 6 | **sprite 预渲染** | 每条弹幕的描边+填充只在入场时画一次到离屏画布，主循环里只剩 `drawImage`（比每帧 `strokeText+fillText` 快一个数量级） | `_rasterize()` |
+| 6 | **sprite 预渲染 + 共用** | 每条弹幕的描边+填充只画一次到离屏画布，主循环里只剩 `drawImage`（比每帧 `strokeText+fillText` 快一个数量级）。文字+颜色+字号相同的弹幕共用一张 sprite（引用计数，归零后进空闲 LRU），刷屏的"哈哈哈"只画一次；空闲时间里还会提前画好时间轴上接下来 2 秒的弹幕和推送队列队头的几条 | `_acquireSprite()` / `_prerender()` |
 | 7 | **对象池 + sprite 复用** | 热路径零对象分配，离屏画布重复使用不重新分配 —— 避免 GC 造成的周期性卡顿（GC 暂停是"莫名掉一下帧"的头号元凶） | `SpritePool` / `_pool` |
-| 8 | **剔除与丢弃** | 画布外的弹幕不绘制；先量宽度找轨道，放得下才光栅化；时间轴弹幕轨道全满时丢弃（B 站同样丢弃） | `_draw()` / `_place()` |
+| 8 | **剔除与丢弃** | 画布外的弹幕不绘制；先量宽度找轨道，放得下才光栅化；时间轴弹幕轨道全满时丢弃（B 站同样丢弃），打开「允许重叠」则叠到最快腾出来的轨道上 | `_draw()` / `_place()` |
 | 9 | **推送排队、匀速放出** | 论坛每次轮询会一下子来一批回复，直接上屏会排成一竖排、超出轨道数的全丢。推送先进队列，令牌桶按积压量匀速放出，有空轨道才上屏，排队超 8 秒丢弃 | `push()` / `_drainPending()` |
 | 10 | **描边而非阴影** | `shadowBlur` 是 Canvas 最贵的操作之一；B 站用细描边保证任何背景上的可读性，成本低得多 | `_rasterize()` |
 
@@ -128,6 +128,7 @@ engine.push({ text: '论坛最新回复', color: '#fb7299' });   // 直播推送
 engine.seek(video.currentTime);                            // 点播 seek 后重定位
 engine.setMode('live' | 'timeline');
 engine.setOpacity(0.7); engine.setSpeedRate(1.5); engine.setFontSize(20); engine.setArea(0.5);
+engine.setOverlap(true);                                   // 满屏时叠加显示而不是丢弃
 engine.onStats = (s) => console.log(s.fps, s.active, s.dropped);
 ```
 

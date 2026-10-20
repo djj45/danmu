@@ -95,6 +95,7 @@ function setupTimeline(duration) {
   progress.style.display = '';
   engine.setMode('timeline');
   engine.loadTimeline(items);
+  renderProgress(); // 暂停状态下装配时进度循环没在跑，补画一次
 }
 
 function setupLive() {
@@ -156,11 +157,17 @@ const fmt = (t) => {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 
-/* 进度条：UI 用独立 rAF 刷新（timeupdate 只有 4Hz，会跳）。
-   只在值变化时写 DOM：每帧重写 textContent 会让暂停时也每帧触发一次重排 */
-let uiPlayed = -1, uiBuffered = -1, uiLabel = '';
-(function uiLoop() {
-  requestAnimationFrame(uiLoop);
+/* 进度条：播放时用 rAF 刷新（timeupdate 只有 4Hz，会跳），暂停时停掉循环、靠事件刷新。
+   只在值变化时写 DOM：每帧重写 textContent 会每帧触发一次重排 */
+let uiPlayed = -1, uiBuffered = -1, uiLabel = '', uiRaf = 0;
+function uiLoop() {
+  renderProgress();
+  uiRaf = video.paused || video.ended ? 0 : requestAnimationFrame(uiLoop);
+}
+video.addEventListener('play', () => { if (!uiRaf) uiRaf = requestAnimationFrame(uiLoop); });
+for (const ev of ['timeupdate', 'seeking', 'progress', 'durationchange']) video.addEventListener(ev, renderProgress);
+
+function renderProgress() {
   if (engine.mode !== 'timeline' || !isFinite(video.duration)) return;
   const d = video.duration, p = video.currentTime / d;
   if (p !== uiPlayed) {
@@ -176,7 +183,7 @@ let uiPlayed = -1, uiBuffered = -1, uiLabel = '';
       if (b !== uiBuffered) { uiBuffered = b; buffered.style.width = (b * 100) + '%'; }
     }
   } catch { /* ignore */ }
-})();
+}
 
 let dragging = false;
 const seekByEvent = (e) => {
@@ -288,6 +295,7 @@ $('dmSwitch').onclick = (e) => {
   const on = e.currentTarget.classList.toggle('on');
   engine.setVisible(on);
 };
+$('overlapSwitch').onclick = (e) => engine.setOverlap(e.currentTarget.classList.toggle('on'));
 $('opacityRange').oninput = (e) => {
   const v = +e.target.value;
   engine.setOpacity(v / 100);
