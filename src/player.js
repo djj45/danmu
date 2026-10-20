@@ -156,17 +156,24 @@ const fmt = (t) => {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 
-/* 进度条：UI 用独立 rAF 刷新（timeupdate 只有 4Hz，会跳） */
+/* 进度条：UI 用独立 rAF 刷新（timeupdate 只有 4Hz，会跳）。
+   只在值变化时写 DOM：每帧重写 textContent 会让暂停时也每帧触发一次重排 */
+let uiPlayed = -1, uiBuffered = -1, uiLabel = '';
 (function uiLoop() {
   requestAnimationFrame(uiLoop);
   if (engine.mode !== 'timeline' || !isFinite(video.duration)) return;
   const d = video.duration, p = video.currentTime / d;
-  played.style.width = (p * 100) + '%';
-  knob.style.left = (p * 100) + '%';
-  timeLabel.textContent = `${fmt(video.currentTime)} / ${fmt(d)}`;
+  if (p !== uiPlayed) {
+    uiPlayed = p;
+    played.style.width = (p * 100) + '%';
+    knob.style.left = (p * 100) + '%';
+  }
+  const label = `${fmt(video.currentTime)} / ${fmt(d)}`;
+  if (label !== uiLabel) { uiLabel = label; timeLabel.textContent = label; }
   try {
     if (video.buffered.length) {
-      buffered.style.width = (video.buffered.end(video.buffered.length - 1) / d * 100) + '%';
+      const b = video.buffered.end(video.buffered.length - 1) / d;
+      if (b !== uiBuffered) { uiBuffered = b; buffered.style.width = (b * 100) + '%'; }
     }
   } catch { /* ignore */ }
 })();
@@ -306,7 +313,7 @@ for (const segId of ['speedSeg', 'areaSeg']) {
 $('showStatsChk').onchange = (e) => statsEl.classList.toggle('hidden', !e.target.checked);
 statsEl.classList.remove('hidden');
 engine.onStats = (s) => {
-  statsEl.textContent = `${s.fps} FPS · 屏上 ${s.active} · 已发 ${s.displayed} · 丢弃 ${s.dropped}`;
+  statsEl.textContent = `${s.fps} FPS · 屏上 ${s.active} · 排队 ${s.pending} · 已发 ${s.displayed} · 丢弃 ${s.dropped}`;
 };
 
 /* 测试弹幕（B站样本，时间轴数据）开关：关掉后只剩实时推送的弹幕 */

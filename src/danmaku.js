@@ -10,13 +10,22 @@
  *  5. 轨道(lane)分配 + "追尾"碰撞判定：长弹幕速度更快，不允许在途中追上前车
  *  6. 每条弹幕预渲染成离屏 sprite（描边+填充只画一次），主循环里只 drawImage
  *  7. sprite 画布复用 + 弹幕对象池：热路径零对象分配，避免 GC 造成的掉帧卡顿
- *  8. 画布外的弹幕直接剔除不绘制
+ *  8. 画布外的弹幕直接剔除不绘制；先量宽度、确定有空轨道才光栅化，丢弃的弹幕不浪费渲染
+ *  9. 实时推送先进队列再匀速放出：论坛轮询一次来一批，也不会排成一竖排同时上屏
  */
 export const DanmakuMode = { SCROLL: 1, BOTTOM: 4, TOP: 5 };
 
 const DEFAULT_FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif';
 /** sprite 离屏画布最多 2x 缩放：清晰度足够，内存省一半以上 */
 const SPRITE_DPR_CAP = 2;
+/** B 站弹幕数据里的"标准"字号；item.fontsize 按它的比例跟随用户设置的字号缩放 */
+const BASE_FONT_SIZE = 25;
+
+/* 推送队列：令牌桶匀速放出，积压越多放得越快，但不会快过轨道的接纳能力 */
+const PENDING_SPREAD = 3;    // 秒：把当前积压大致摊到这么长时间里放完
+const PENDING_MIN_RATE = 6;  // 条/秒：积压很少时的最低放出速率
+const PENDING_TTL = 8;       // 秒：排队超过这么久的已经不"实时"了，直接丢弃
+const PENDING_MAX = 300;     // 队列上限，超出丢最旧的
 
 class SpritePool {
   constructor() { this.free = []; }
@@ -70,7 +79,7 @@ export class DanmakuEngine {
     this.list = [];
     this.idx = 0;
     this.active = [];
-    this.stats = { fps: 0, active: 0, displayed: 0, dropped: 0 };
+    this.stats = { fps: 0, active: 0, pending: 0, displayed: 0, dropped: 0 };
     /** 引擎会以 ~4Hz 回调统计数据（FPS、屏上数量等） */
     this.onStats = null;
 
@@ -85,6 +94,11 @@ export class DanmakuEngine {
     this._fpsEma = 60;
     this._statsTick = 0;
     this._dirty = true;
+    this._blank = true;          // 画布当前是否已是空白（空屏时不再每帧 clearRect）
+    this._measureFont = null;    // this.ctx 上一次设置的 font，避免重复解析字体串
+    this._pending = [];          // push 进来、等待上屏的弹幕（已量好宽度）
+    this._tokens = 1;
+    this._drainAt = performance.now() / 1000;
 
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'danmaku-canvas';
@@ -137,11 +151,39 @@ export class DanmakuEngine {
     if (mode === 'timeline') this.seek(this.video ? this.video.currentTime : 0);
   }
 
-  /** 实时推送一条弹幕（直播/论坛回复接入口），返回是否成功上屏 */
+  /**
+   * 实时推送一条弹幕（直播/论坛回复接入口）。
+   * 不直接上屏而是先排队：空闲时第一条立即上屏，一批同时到达的按令牌桶匀速放出，
+   * 有空轨道才上屏，排队超过 PENDING_TTL 秒的丢弃。返回是否被接收（已上屏或在排队）。
+   */
   push(item) {
-    const before = this.stats.dropped;
-    this.dispatch(item);
-    return this.stats.dropped === before;
+    if (!this.visible) { this.stats.dropped++; return false; }
+    const p = this._prepare(item);
+    if (!p) return false;
+    p.at = performance.now() / 1000;
+    const q = this._pending;
+    q.push(p);
+    if (q.length > PENDING_MAX) { q.shift(); this.stats.dropped++; }
+    this._drainPending(this._playing());
+    return true;
+  }
+
+  /** 每帧调用：按令牌桶从队头放出弹幕；没空轨道时保持先后顺序，下一帧再试 */
+  _drainPending(playing) {
+    const now = performance.now() / 1000;
+    const dt = Math.min(0.25, now - this._drainAt);
+    this._drainAt = now;
+    const q = this._pending;
+    // 桶容量 1：空闲后的第一条立即上屏；积压时速率 = 积压量 / 摊开时长
+    const rate = Math.max(PENDING_MIN_RATE, q.length / PENDING_SPREAD);
+    this._tokens = Math.min(1, this._tokens + dt * rate);
+    while (q.length) {
+      const p = q[0];
+      if (now - p.at > PENDING_TTL) { q.shift(); this.stats.dropped++; continue; }
+      if (!playing || this._tokens < 1 || !this._place(p, 'push')) break;
+      q.shift();
+      this._tokens -= 1;
+    }
   }
 
   /** 内部：时间轴派发入口，标记来源便于按来源开关 */
@@ -171,7 +213,11 @@ export class DanmakuEngine {
   /* ------------------------------------------------------------ 设置 */
 
   setOpacity(v) { this.opacity = Math.min(1, Math.max(0, v)); this._dirty = true; }
-  setVisible(b) { this.visible = b; if (!b) this.clear(); this._dirty = true; }
+  setVisible(b) {
+    this.visible = b;
+    if (!b) { this.clear(); this._pending.length = 0; }
+    this._dirty = true;
+  }
 
   /** 开关时间轴（预置样本）弹幕：关闭时把屏上的时间轴弹幕一并清掉，push 的实时弹幕保留 */
   setTimelineEnabled(b) {
@@ -217,15 +263,29 @@ export class DanmakuEngine {
 
   resize() {
     const rect = this.container.getBoundingClientRect();
-    this.width = Math.max(50, Math.round(rect.width));
-    this.height = Math.max(50, Math.round(rect.height));
-    this.dpr = Math.min(2.5, window.devicePixelRatio || 1);
-    this.canvas.width = Math.round(this.width * this.dpr);
-    this.canvas.height = Math.round(this.height * this.dpr);
-    this.canvas.style.width = this.width + 'px';
-    this.canvas.style.height = this.height + 'px';
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    const W = Math.max(50, Math.round(rect.width));
+    const H = Math.max(50, Math.round(rect.height));
+    const dpr = Math.min(2.5, window.devicePixelRatio || 1);
+    if (W === this.width && H === this.height && dpr === this.dpr) return; // 尺寸没变就不重建画布
+    const oldW = this.width;
+    this.width = W; this.height = H; this.dpr = dpr;
+    this.canvas.width = Math.round(W * dpr);
+    this.canvas.height = Math.round(H * dpr);
+    this.canvas.style.width = W + 'px';
+    this.canvas.style.height = H + 'px';
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // 改画布尺寸会重置 context 状态
+    this._measureFont = null;
+    this._blank = true;
     this._rebuildLanes();
+    if (oldW) {
+      // 屏上已有的弹幕跟着新尺寸重新布局：否则进出全屏时滚动弹幕整体跳 ΔW、底部弹幕悬在半空
+      const dW = W - oldW;
+      for (const it of this.active) {
+        if (it.mode === DanmakuMode.SCROLL) it.t0 -= dW / it.v; // x = W - v(t-t0) 保持不变
+        else it.x = Math.max(0, (W - it.w) / 2);
+        it.y = this._laneY(it.mode, it.lane, it.sprite.ch);
+      }
+    }
     this._dirty = true;
   }
 
@@ -235,6 +295,19 @@ export class DanmakuEngine {
       if (lanes.length > n) lanes.length = n;
       while (lanes.length < n) lanes.push(null);
     }
+    // 被删掉的轨道上的弹幕失去了碰撞跟踪，留着会和之后的新弹幕叠在一起，直接回收
+    for (let k = this.active.length - 1; k >= 0; k--) {
+      if (this.active[k].lane >= n) this._recycle(k);
+    }
+    this._dirty = true;
+  }
+
+  /** sprite 在轨道内垂直居中（sprite 高度已含行距，文字在 sprite 内居中） */
+  _laneY(mode, lane, ch) {
+    const off = (this.lineHeight - ch) >> 1;
+    return mode === DanmakuMode.BOTTOM
+      ? this.height - (lane + 1) * this.lineHeight + off
+      : lane * this.lineHeight + off;
   }
 
   /* ------------------------------------------------------------ 渲染循环 */
@@ -248,9 +321,7 @@ export class DanmakuEngine {
     this._lastFrameTs = ts;
 
     const t = this.clock();
-    const playing = this.mode === 'live'
-      ? this._liveFrozenAt == null
-      : !!this.video && !this.video.paused && !this.video.ended;
+    const playing = this._playing();
 
     if (this.mode === 'timeline' && playing && this.timelineEnabled) {
       if (Math.abs(t - this._lastT) > 2) {
@@ -265,6 +336,7 @@ export class DanmakuEngine {
       }
     }
     this._lastT = t;
+    this._drainPending(playing);
 
     if (playing || this._dirty) {
       this._draw(t);
@@ -273,18 +345,31 @@ export class DanmakuEngine {
 
     this.stats.fps = Math.round(this._fpsEma);
     this.stats.active = this.active.length;
+    this.stats.pending = this._pending.length;
     if (this.onStats && ts - this._statsTick > 250) {
       this._statsTick = ts;
       this.onStats({ ...this.stats });
     }
   }
 
+  /** 弹幕是否在走：直播看可冻结的墙上时钟，点播看视频播放状态 */
+  _playing() {
+    return this.mode === 'live'
+      ? this._liveFrozenAt == null
+      : !!this.video && !this.video.paused && !this.video.ended;
+  }
+
   _draw(t) {
-    const ctx = this.ctx, W = this.width;
+    const ctx = this.ctx, W = this.width, act = this.active;
+    if (!act.length) {
+      // 空屏只清一次：之后不再碰画布，画布层不被标脏，合成器就不用每帧重新提交它
+      if (!this._blank) { ctx.clearRect(0, 0, W, this.height); this._blank = true; }
+      return;
+    }
     ctx.clearRect(0, 0, W, this.height);
+    this._blank = false;
     if (!this.visible) return;
     ctx.globalAlpha = this.opacity;
-    const act = this.active;
     for (let k = act.length - 1; k >= 0; k--) {
       const it = act[k];
       if (it.mode === DanmakuMode.SCROLL) {
@@ -315,46 +400,68 @@ export class DanmakuEngine {
 
   /* ------------------------------------------------------------ 弹幕分配 */
 
+  /** 立即上屏一条弹幕（不排队），放不下就丢弃 */
   dispatch(item, origin = 'push') {
-    if (!this.visible || this.active.length >= this.maxActive) { this.stats.dropped++; return; }
+    const p = this._prepare(item);
+    if (p && !this._place(p, origin)) this.stats.dropped++;
+  }
+
+  /** 规范化 + 量宽度（还不光栅化）；空文本或宽得离谱的返回 null */
+  _prepare(item) {
     let text = (item.text ?? '').trim();
-    if (!text) return;
+    if (!text) return null;
     if (text.length > 80) text = text.slice(0, 80);
-    const mode = item.mode ?? DanmakuMode.SCROLL;
-    const fontSize = Math.min(36, Math.max(12, item.fontsize ?? this.fontSize));
-    const sprite = this._rasterize(text, fontSize, item.color ?? '#ffffff');
-    if (!sprite) { this.stats.dropped++; return; }
+    const m = item.mode;
+    // B 站的 2/3（旧滚动）、6（逆向）等都按普通滚动处理
+    const mode = m === DanmakuMode.TOP || m === DanmakuMode.BOTTOM ? m : DanmakuMode.SCROLL;
+    // 数据自带的字号按 25 为基准跟随用户设置缩放；上限是轨道字号，否则会压到相邻轨道
+    const scaled = Math.round(this.fontSize * (item.fontsize ?? BASE_FONT_SIZE) / BASE_FONT_SIZE);
+    const fontSize = Math.min(this.fontSize, Math.max(12, scaled));
+    const font = `600 ${fontSize}px ${this.fontFamily}`;
+    if (this._measureFont !== font) { this.ctx.font = font; this._measureFont = font; }
+    const w = Math.ceil(this.ctx.measureText(text).width);
+    if (!(w > 0) || w > this.width * 2) { this.stats.dropped++; return null; }
+    return { text, mode, fontSize, font, w, color: item.color ?? '#ffffff', at: 0 };
+  }
 
-    const t = this.clock(), W = this.width;
-    const it = this._pool.pop() ?? {};
-    it.mode = mode; it.sprite = sprite; it.w = sprite.textW; it.fontSize = fontSize;
-    it.origin = origin;
-
+  /** 找轨道，找到了才光栅化上屏；没有空轨道返回 false（sprite 一次都不画） */
+  _place(p, origin) {
+    if (!this.visible || this.active.length >= this.maxActive) return false;
+    const t = this.clock(), W = this.width, mode = p.mode;
+    let lane, v = 0;
     if (mode === DanmakuMode.SCROLL) {
       // 走完整个画面用时固定 baseDuration/speedRate → 文字越长速度越快，同一轨道不会追尾
-      const v = (W + it.w) / (this.baseDuration / this.speedRate);
-      const lane = this._pickScrollLane(it.w, v, t);
-      if (lane < 0) { this._sprites.release(sprite.canvas); this._pool.push(it); this.stats.dropped++; return; }
-      it.v = v; it.t0 = t; it.x = W; it.lane = lane;
-      it.y = lane * this.lineHeight + ((this.lineHeight - fontSize) >> 1);
+      v = (W + p.w) / (this.baseDuration / this.speedRate);
+      lane = this._pickScrollLane(p.w, v, t);
+    } else {
+      lane = this._pickFixedLane(mode === DanmakuMode.TOP ? this._topLanes : this._bottomLanes, t);
+    }
+    if (lane < 0) return false;
+
+    const sprite = this._rasterize(p.text, p.font, p.fontSize, p.w, p.color);
+    const it = this._pool.pop() ?? {};
+    it.mode = mode; it.sprite = sprite; it.w = p.w; it.fontSize = p.fontSize;
+    it.origin = origin; it.v = v; it.t0 = t; it.lane = lane;
+    it.y = this._laneY(mode, lane, sprite.ch);
+    if (mode === DanmakuMode.SCROLL) {
+      it.x = W;
       this._scrollLanes[lane] = it;
     } else {
-      const lanes = mode === DanmakuMode.TOP ? this._topLanes : this._bottomLanes;
-      let lane = -1;
-      for (let k = 0; k < lanes.length; k++) {
-        if (!lanes[k] || t >= lanes[k].expire) { lane = k; break; }
-      }
-      if (lane < 0) { this._sprites.release(sprite.canvas); this._pool.push(it); this.stats.dropped++; return; }
-      it.v = 0; it.t0 = t; it.expire = t + 5;
-      it.x = Math.max(0, (W - it.w) / 2); it.lane = lane;
-      it.y = mode === DanmakuMode.TOP
-        ? lane * this.lineHeight + ((this.lineHeight - fontSize) >> 1)
-        : this.height - (lane + 1) * this.lineHeight + ((this.lineHeight - fontSize) >> 1);
-      lanes[lane] = it;
+      it.expire = t + 5;
+      it.x = Math.max(0, (W - p.w) / 2);
+      (mode === DanmakuMode.TOP ? this._topLanes : this._bottomLanes)[lane] = it;
     }
     this.active.push(it);
     this.stats.displayed++;
     this._dirty = true;
+    return true;
+  }
+
+  _pickFixedLane(lanes, t) {
+    for (let k = 0; k < lanes.length; k++) {
+      if (!lanes[k] || t >= lanes[k].expire) return k;
+    }
+    return -1;
   }
 
   /**
@@ -375,16 +482,11 @@ export class DanmakuEngine {
       if (catchUpAt > (W + w) / v) return i;          // 我先出场
       if (catchUpAt > (prevX + prev.w) / prev.v) return i; // 前车先出场
     }
-    return -1; // 全满，丢弃（B 站同样会丢弃放不下的弹幕）
+    return -1; // 全满：时间轴弹幕丢弃（B 站同样如此），推送弹幕留在队列里等下一帧
   }
 
   /** 把文字预渲染成带描边的 sprite，之后每帧只需一次 drawImage */
-  _rasterize(text, fontSize, color) {
-    const font = `600 ${fontSize}px ${this.fontFamily}`;
-    const ctx = this.ctx;
-    ctx.font = font;
-    const textW = Math.ceil(ctx.measureText(text).width);
-    if (!isFinite(textW) || textW <= 0 || textW > this.width * 2) return null;
+  _rasterize(text, font, fontSize, textW, color) {
     const pad = Math.max(2, Math.ceil(fontSize / 6));
     const cw = textW + pad * 2;
     const ch = Math.ceil(fontSize * 1.3);

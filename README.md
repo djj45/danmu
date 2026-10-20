@@ -85,8 +85,9 @@ B 站网页播放器的弹幕层是一个铺在视频上的 `<canvas>`（打开�
 | 5 | **轨道分配 + 追尾判定** | 画面按行高切成轨道；新弹幕入轨前判断"会不会在途中追上前车"（匀速运动可精确算出追上时刻）。文字越小速度越慢，越长越快 | `_pickScrollLane()` |
 | 6 | **sprite 预渲染** | 每条弹幕的描边+填充只在入场时画一次到离屏画布，主循环里只剩 `drawImage`（比每帧 `strokeText+fillText` 快一个数量级） | `_rasterize()` |
 | 7 | **对象池 + sprite 复用** | 热路径零对象分配，离屏画布重复使用不重新分配 —— 避免 GC 造成的周期性卡顿（GC 暂停是"莫名掉一下帧"的头号元凶） | `SpritePool` / `_pool` |
-| 8 | **剔除与丢弃** | 画布外的弹幕不绘制；轨道全满时丢弃（B 站同样丢弃），永不积压 | `_draw()` / `_pickScrollLane()` |
-| 9 | **描边而非阴影** | `shadowBlur` 是 Canvas 最贵的操作之一；B 站用细描边保证任何背景上的可读性，成本低得多 | `_rasterize()` |
+| 8 | **剔除与丢弃** | 画布外的弹幕不绘制；先量宽度找轨道，放得下才光栅化；时间轴弹幕轨道全满时丢弃（B 站同样丢弃） | `_draw()` / `_place()` |
+| 9 | **推送排队、匀速放出** | 论坛每次轮询会一下子来一批回复，直接上屏会排成一竖排、超出轨道数的全丢。推送先进队列，令牌桶按积压量匀速放出，有空轨道才上屏，排队超 8 秒丢弃 | `push()` / `_drainPending()` |
+| 10 | **描边而非阴影** | `shadowBlur` 是 Canvas 最贵的操作之一；B 站用细描边保证任何背景上的可读性，成本低得多 | `_rasterize()` |
 
 另外两个容易忽视的点：
 
@@ -123,7 +124,7 @@ const engine = new DanmakuEngine(container, video, {
 });
 
 engine.loadTimeline([{ time: 3.2, text: '前方高能', color: '#ffffff', mode: DanmakuMode.SCROLL }]);
-engine.push({ text: '论坛最新回复', color: '#fb7299' });   // 直播推送（论坛接入口）
+engine.push({ text: '论坛最新回复', color: '#fb7299' });   // 直播推送（论坛接入口），一批同时到达会排队匀速上屏
 engine.seek(video.currentTime);                            // 点播 seek 后重定位
 engine.setMode('live' | 'timeline');
 engine.setOpacity(0.7); engine.setSpeedRate(1.5); engine.setFontSize(20); engine.setArea(0.5);
