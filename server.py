@@ -46,6 +46,8 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.4 Safari/605.1.15")
 # B 站经典弹幕色板，按用户名哈希取色，同一用户颜色稳定
 PALETTE = ["#ffffff", "#fe0302", "#ff7204", "#ffff00", "#01cd5e", "#00c3ff", "#c74dde", "#fb7299"]
+# 每轮只补最近四页；长时间离线时优先恢复实时内容，不无限追赶历史。
+MAX_CATCHUP_PAGES = 4
 
 try:
     import aiotieba
@@ -166,14 +168,16 @@ class Hub:
 
     def broadcast(self, event: dict) -> None:
         with self._lock:
-            dead = []
             for q in self._clients:
                 try:
                     q.put_nowait(event)
                 except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self._clients.discard(q)
+                    # 慢客户端保留订阅，淘汰最旧事件，不能留下只有心跳的连接。
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:  # 消费线程可能刚好已清空
+                        pass
+                    q.put_nowait(event)
 
 
 HUB = Hub()
@@ -190,26 +194,33 @@ class Source(threading.Thread):
         self.url = url
         self.interval = max(2.0, float(interval))
         self.backlog = max(0, int(backlog))
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._seen: set[str] = set()
+        self._last_pid = 0
         self._first = True
         self.replies_pushed = 0
         self.last_floor = None
         self.last_poll = 0.0
         self.status = "starting"
         self.last_error = ""
+        self.catchup_limited = 0
 
     # 子类实现：返回 [{pid, user, text, floor}]，按楼层升序
     def poll(self) -> list[dict]:
         raise NotImplementedError
 
     def emit(self, replies: list[dict]) -> None:
-        fresh = [r for r in replies if str(r["pid"]) not in self._seen]
-        for r in fresh:
-            self._seen.add(str(r["pid"]))
+        self.status, self.last_error = "running", ""
+        fresh = []
+        for r in replies:
+            pid = str(r["pid"])
+            if pid not in self._seen:
+                self._seen.add(pid)
+                fresh.append(r)
         if not fresh:
             return
-        fresh.sort(key=lambda r: (r.get("floor") or 0, str(r["pid"])))
+        fresh.sort(key=lambda r: (r.get("floor") or 0, int(r["pid"])))
+        self._last_pid = max(self._last_pid, *(int(r["pid"]) for r in fresh))
         for r in fresh:
             if r.get("floor") is not None:
                 self.last_floor = r["floor"]
@@ -238,17 +249,41 @@ class Source(threading.Thread):
         return {"id": self.sid, "type": self.type_name, "url": self.url,
                 "interval": self.interval, "status": self.status,
                 "error": self.last_error, "pushed": self.replies_pushed,
-                "lastFloor": self.last_floor, "lastPoll": self.last_poll}
+                "lastFloor": self.last_floor, "lastPoll": self.last_poll,
+                "catchupLimited": self.catchup_limited}
+
+    def recent_replies(self, fetch_page, last: int | None = None) -> list[dict]:
+        """从最新页向历史补齐，遇到上次最新回复停止；首轮只回放最新页。
+
+        last=None 表示接口倒序分页（第 1 页最新）。所有页成功后才交给 emit，
+        中途失败不会推进去重状态，下一轮仍能重试。
+        """
+        pages = (range(1, MAX_CATCHUP_PAGES + 1) if last is None else
+                 range(last, max(0, last - MAX_CATCHUP_PAGES), -1))
+        replies = []
+        for pn in pages:
+            batch = fetch_page(pn)
+            # 三个源的 pid 均按回复创建顺序增长。旧置顶楼层不能充当分页边界；
+            # 边界回复被删除时，也不能把更早、从未加载过的历史内容当作新回复。
+            replies.extend(r for r in batch if self._first or int(r["pid"]) > self._last_pid)
+            boundary = batch and (any(int(r["pid"]) == self._last_pid for r in batch)
+                                  or max(int(r["pid"]) for r in batch) < self._last_pid)
+            if self._first or (not batch and last is None) or boundary:
+                break
+        else:
+            if last is None or last > MAX_CATCHUP_PAGES:
+                self.catchup_limited += 1
+        return replies
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self.poll_once()
                 HUB.broadcast({"type": "status", "source": self.summary()})
             except Exception as e:  # noqa: BLE001 轮询失败要保活并暴露给 UI
                 self.fail(str(e))
                 HUB.broadcast({"type": "status", "source": self.summary()})
-            self._stop.wait(self.interval)
+            self._stop_event.wait(self.interval)
         self.status = "stopped"
 
     def poll_once(self) -> list[dict]:
@@ -258,7 +293,7 @@ class Source(threading.Thread):
         return replies
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ---------------------------------------------------------------- 贴吧（aiotieba）
@@ -310,9 +345,9 @@ async def _tb_client() -> "aiotieba.Client":
     return _TB_CLIENT
 
 
-async def _tb_get_posts(tid: int) -> list[dict]:
+async def _tb_get_posts(tid: int, pn: int = 1) -> list[dict]:
     posts = await (await _tb_client()).get_posts(
-        tid, pn=1, rn=30, sort=aiotieba.enums.PostSortType.DESC)
+        tid, pn=pn, rn=30, sort=aiotieba.enums.PostSortType.DESC)
     out = []
     for p in posts.objs:
         user = getattr(getattr(p, "user", None), "show_name", "") or \
@@ -338,8 +373,14 @@ class TiebaSource(Source):
     def poll(self) -> list[dict]:
         if aiotieba is None:
             raise RuntimeError("未安装 aiotieba")
-        fut = asyncio.run_coroutine_threadsafe(_tb_get_posts(self.tid), ensure_loop())
-        return fut.result(timeout=30)
+        def fetch_page(pn):
+            fut = asyncio.run_coroutine_threadsafe(_tb_get_posts(self.tid, pn), ensure_loop())
+            try:
+                return fut.result(timeout=30)
+            except TimeoutError:
+                fut.cancel()
+                raise
+        return self.recent_replies(fetch_page)
 
 
 # ---------------------------------------------------------------- Stage1st（Discuz 账号密码登录）
@@ -414,16 +455,18 @@ class S1Source(Source):
         page = decode_page(body, ctype)
         pages = [int(x) for x in S1_PAGE_RE.findall(page)]
         last = max(pages) if pages else 1
-        if last > 1:
-            body, _, ctype = http_request(self._page_url(last), self.jar)
-            page = decode_page(body, ctype)
-        posts = self.parse_posts(page)
-        if not posts:
-            raise RuntimeError("S1 页面解析不到回复（未登录或页面结构变化）")
-        # pid 单调对应楼层顺序，用它推断楼层号
-        for i, p in enumerate(posts, 1):
-            p["floor"] = (last - 1) * 40 + i
-        return posts
+        def fetch_page(pn):
+            content = page
+            if pn != 1:
+                body, _, ctype = http_request(self._page_url(pn), self.jar)
+                content = decode_page(body, ctype)
+            posts = self.parse_posts(content)
+            if not posts:
+                raise RuntimeError("S1 页面解析不到回复（未登录或页面结构变化）")
+            for i, p in enumerate(posts, 1):
+                p["floor"] = (pn - 1) * 40 + i
+            return posts
+        return self.recent_replies(fetch_page, last)
 
 
 # ---------------------------------------------------------------- NGA（Cookie + lite=js 接口）
@@ -491,8 +534,14 @@ class NGASource(Source):
         except ValueError:
             replies = 0
         last = replies // 20 + 1 if replies > 0 else 1
-        if last > 1:
-            d = self._fetch(last)  # 只看末页的最新回复
+        def fetch_page(pn):
+            return self._parse_replies(d if pn == 1 else self._fetch(pn))
+        return self.recent_replies(fetch_page, last)
+
+    @staticmethod
+    def _parse_replies(d: dict) -> list[dict]:
+        if not isinstance(d.get("__R"), dict):
+            raise RuntimeError("NGA 回复数据缺失（权限不足或响应结构变化）")
         users = d.get("__U", {})
         out = []
         for row in (d.get("__R") or {}).values():
@@ -505,8 +554,6 @@ class NGASource(Source):
                 continue
             out.append({"pid": int(pid), "user": author.get("username") or f"UID:{row.get('authorid')}",
                         "text": text, "floor": row.get("lou")})
-        if not out:
-            raise RuntimeError("NGA 帖子解析不到回复（无回复或权限不足）")
         return out
 
 

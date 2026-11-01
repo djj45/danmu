@@ -35,6 +35,7 @@ async function ensureHlsJs() {
 async function loadSource(url) {
   stopSim();
   destroyHls();
+  engine.resetSession();
   showTip('spinner');
   try {
     if (/\.m3u8(\?|#|$)/i.test(url)) {
@@ -93,7 +94,7 @@ function setupTimeline(duration) {
   }
   liveBadge.classList.add('hidden');
   progress.style.display = '';
-  engine.setMode('timeline');
+  if (engine.mode !== 'timeline') engine.setMode('timeline');
   engine.loadTimeline(items);
   renderProgress(); // 暂停状态下装配时进度循环没在跑，补画一次
 }
@@ -101,13 +102,15 @@ function setupTimeline(duration) {
 function setupLive() {
   liveBadge.classList.remove('hidden');
   progress.style.display = 'none';
-  engine.setMode('live');
+  if (engine.mode !== 'live') engine.setMode('live');
 }
 
 video.addEventListener('seeking', () => {
   if (engine.mode === 'timeline') engine.seek(video.currentTime);
 });
-video.addEventListener('pause', () => { if (engine.mode === 'live') engine.freezeLiveClock(); updatePlayIcon(); });
+for (const event of ['pause', 'ended']) {
+  video.addEventListener(event, () => { if (engine.mode === 'live') engine.freezeLiveClock(); updatePlayIcon(); });
+}
 video.addEventListener('play', () => { if (engine.mode === 'live') engine.unfreezeLiveClock(); updatePlayIcon(); hideTip(); });
 
 fetch('data/danmaku-bilibili.json')
@@ -321,7 +324,10 @@ for (const segId of ['speedSeg', 'areaSeg']) {
 $('showStatsChk').onchange = (e) => statsEl.classList.toggle('hidden', !e.target.checked);
 statsEl.classList.remove('hidden');
 engine.onStats = (s) => {
-  statsEl.textContent = `${s.fps} FPS · 屏上 ${s.active} · 排队 ${s.pending} · 已发 ${s.displayed} · 丢弃 ${s.dropped}`;
+  statsEl.textContent = `${s.fps} FPS · 屏上 ${s.active} · 排队 ${s.pending} · 已发 ${s.displayed} · 丢弃 ${s.dropped}\n帧 P95/P99 ${s.frameP95}/${s.frameP99}ms · 等待 P95 ${Math.round(s.queueP95)}ms · 缓存 ${s.spriteMB.toFixed(1)}MB`;
+  const labels = { hidden: '隐藏', invalid: '无效内容', queueFull: '队满', expired: '超时',
+    noLane: '无轨道', capacity: '屏上数量上限', memory: '内存上限', reset: '切换会话' };
+  statsEl.title = Object.entries(s.dropReasons).map(([key, value]) => `${labels[key]} ${value}`).join(' · ');
 };
 
 /* 测试弹幕（B站样本，时间轴数据）开关：关掉后只剩实时推送的弹幕 */
@@ -357,7 +363,7 @@ function renderSources(sources) {
     const state = document.createElement('span');
     state.className = 'f-state ' + (s.status === 'running' ? 'ok' : s.status === 'error' ? 'err' : '');
     state.textContent = s.status === 'running'
-      ? `已推 ${s.pushed} 条${s.lastFloor != null ? ` · 楼层 #${s.lastFloor}` : ''}`
+      ? `已推 ${s.pushed} 条${s.lastFloor != null ? ` · 楼层 #${s.lastFloor}` : ''}${s.catchupLimited ? ` · 补页达上限 ${s.catchupLimited} 次` : ''}`
       : (s.error || s.status);
     li.innerHTML = `<span class="f-type">${TYPE_LABEL[s.type] ?? s.type}</span>
       <span class="f-url" title="${s.url}">${s.url}</span>`;

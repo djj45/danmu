@@ -47,7 +47,8 @@
     position: absolute; top: 12px; right: 12px; z-index: 4;
     font-size: 12px; color: #fff; background: rgba(0, 0, 0, 0.45);
     padding: 4px 10px; border-radius: 6px; font-variant-numeric: tabular-nums;
-    font-family: ui-monospace, Menlo, monospace; pointer-events: none;
+    font-family: ui-monospace, Menlo, monospace; pointer-events: auto;
+    max-width: calc(100% - 24px); white-space: pre-line; line-height: 1.5;
   }
   .center-tip {
     position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
